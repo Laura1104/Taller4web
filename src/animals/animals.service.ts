@@ -1,95 +1,96 @@
 import {
-  Injectable, NotFoundException,
-  BadRequestException, InternalServerErrorException, Logger,
+  Injectable,
+  NotFoundException,
 } from '@nestjs/common';
+
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository }       from 'typeorm';
-import { Animal }           from './entities/animal.entity';
-import { Location }         from '../locations/entities/location.entity';
-import { User }             from '../users/entities/user.entity';
-import { CreateAnimalDto }  from './dto/create-animal.dto';
-import { UpdateAnimalDto }  from './dto/update-animal.dto';
+import { Repository } from 'typeorm';
+
+import { QueryAnimalsDto } from './dto/query-animals.dto';
+import { CreateAnimalDto } from './dto/create-animal.dto';
+import { UpdateAnimalDto } from './dto/update-animal.dto';
+import { CloudinaryService } from 'src/cloudinary/cloudinary.service';
+import { Animal } from './entities/animal.entity';
 
 @Injectable()
 export class AnimalsService {
 
-  private readonly logger = new Logger('AnimalsService');
-
   constructor(
     @InjectRepository(Animal)
     private readonly animalRepo: Repository<Animal>,
-    @InjectRepository(Location)
-    private readonly locationRepo: Repository<Location>,
-    @InjectRepository(User)
-    private readonly userRepo: Repository<User>,
+     private readonly cloudinaryService: CloudinaryService,
   ) {}
+  async findAll(query: QueryAnimalsDto): Promise<{
+    data: Animal[];
+    total: number;
+    page: number;
+    limit: number;
+  }> {
 
-  async create(dto: CreateAnimalDto) {
-    const { locationId, registeredById, ...rest } = dto;
+    const page  = query.page  ?? 1;
+    const limit = query.limit ?? 10;
 
-    let location: Location | null = null;
-    if (locationId) {
-      location = await this.locationRepo.findOne({ where: { id: locationId } });
-      if (!location)
-        throw new NotFoundException(`Location ${locationId} no encontrada`);
-    }
+    const [data, total]: [Animal[], number] =
+      await this.animalRepo.findAndCount({
+        where: {
+          ...(query.especie && { especie: query.especie }),
+          ...(query.estado  && { estado:  query.estado }),
+        },
+        relations: ['registeredBy'],
+        skip: (page - 1) * limit,
+        take: limit,
+      });
 
-    let registeredBy: User | null = null;
-    if (registeredById) {
-      registeredBy = await this.userRepo.findOne({ where: { id: registeredById } });
-      if (!registeredBy)
-        throw new NotFoundException(`User ${registeredById} no encontrado`);
-    }
-
-    try {
-      const animal = this.animalRepo.create(rest);
-      if (location)     animal.location     = location;
-      if (registeredBy) animal.registeredBy = registeredBy;
-      return await this.animalRepo.save(animal);
-    } catch (err) { this.handleError(err); }
+    return { data, total, page, limit };
   }
 
-  async findAll() {
-    return this.animalRepo.find({
-      relations: ['registeredBy'],
-    });
+  
+  async create(dto: CreateAnimalDto): Promise<Animal> {
+    const animal = this.animalRepo.create(dto);
+    return await this.animalRepo.save(animal);
   }
 
-  async findOne(id: string) {
-    const animal = await this.animalRepo.findOne({
-      where: { id },
-      relations: ['registeredBy', 'interestedUsers'],
-    });
-    if (!animal)
+
+  async findOne(id: string): Promise<Animal> {
+    const animal = await this.animalRepo.findOne({ where: { id } });
+
+    if (!animal) {
       throw new NotFoundException(`Animal ${id} no encontrado`);
+    }
+
     return animal;
   }
 
-  async update(id: string, dto: UpdateAnimalDto) {
+
+  async update(id: string, dto: UpdateAnimalDto): Promise<Animal> {
     const animal = await this.findOne(id);
-    this.animalRepo.merge(animal, dto);
-    try {
-      return await this.animalRepo.save(animal);
-    } catch (err) { this.handleError(err); }
+
+    Object.assign(animal, dto);
+
+    return await this.animalRepo.save(animal);
   }
 
-  async remove(id: string) {
+
+  async remove(id: string): Promise<void> {
     const animal = await this.findOne(id);
     await this.animalRepo.remove(animal);
-    return { message: 'Animal eliminado exitosamente' };
   }
 
-  private handleError(err: unknown): never {
-    if (
-      typeof err === 'object' &&
-      err !== null &&
-      'code' in err &&
-      (err as { code: string }).code === '23505'
-    ) {
-      const pgErr = err as { code: string; detail?: string };
-      throw new BadRequestException(`Valor duplicado: ${pgErr.detail}`);
-    }
-    this.logger.error(err);
-    throw new InternalServerErrorException('Error inesperado — revisa los logs');
+  
+  async uploadImagen(id: string, file: Express.Multer.File): Promise<Animal> {
+    // 1. Verificar que el animal existe (lanza 404 si no)
+    await this.findOne(id);
+
+    // 2. Subir el buffer a Cloudinary y recibir la URL
+    const url = await this.cloudinaryService.uploadBuffer(
+      file.buffer,
+      'animales-adopcion',  // carpeta en tu cuenta Cloudinary
+    );
+
+    // 3. Guardar la URL en la columna "imagen"
+    await this.animalRepo.update(id, { imagen: url });
+
+    // 4. Retornar el animal actualizado
+    return this.findOne(id);
   }
 }
